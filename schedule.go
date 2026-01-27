@@ -9,10 +9,23 @@ import (
 	"time"
 )
 
+const (
+	payPeriodDays     = 14
+	maxHoursPerPeriod = 80
+	displayPeriods    = 2
+)
+
 type Employee struct {
 	Name        string
 	Assignments []string // "D", "S", "N", or "" per day
 	Hours       int
+}
+
+type PayPeriodInfo struct {
+	ShiftsPerPeriod  int
+	HoursPerPeriod   int
+	OffDaysPerPeriod int
+	CrewCount        int
 }
 
 func parseNames(s string) []string {
@@ -26,18 +39,33 @@ func parseNames(s string) []string {
 	return names
 }
 
-func buildSchedule(names []string, hoursPerShift, onDays, offBlocks int) ([]Employee, int) {
-	if len(names) == 0 {
-		return nil, 0
+func buildSchedule(names []string, hoursPerShift int) ([]Employee, int, PayPeriodInfo) {
+	info := PayPeriodInfo{}
+	if len(names) == 0 || hoursPerShift <= 0 {
+		return nil, 0, info
 	}
 
+	shiftsPerPeriod := maxHoursPerPeriod / hoursPerShift
+	if shiftsPerPeriod > payPeriodDays {
+		shiftsPerPeriod = payPeriodDays
+	}
+	if shiftsPerPeriod == 0 {
+		return nil, 0, info
+	}
+
+	crewCount := int(math.Ceil(float64(payPeriodDays) / float64(shiftsPerPeriod)))
+	stride := int(math.Ceil(float64(payPeriodDays) / float64(crewCount)))
+
+	info = PayPeriodInfo{
+		ShiftsPerPeriod:  shiftsPerPeriod,
+		HoursPerPeriod:   shiftsPerPeriod * hoursPerShift,
+		OffDaysPerPeriod: payPeriodDays - shiftsPerPeriod,
+		CrewCount:        crewCount,
+	}
+
+	totalDays := payPeriodDays * displayPeriods
+
 	n := len(names)
-	blocksPerEmp := int(math.Ceil(80.0 / float64(hoursPerShift*onDays)))
-	crewCount := 1 + offBlocks
-
-	totalRounds := blocksPerEmp * crewCount
-	totalDays := totalRounds * onDays
-
 	employees := make([]Employee, n)
 	for i, name := range names {
 		employees[i] = Employee{
@@ -49,24 +77,30 @@ func buildSchedule(names []string, hoursPerShift, onDays, offBlocks int) ([]Empl
 	shifts := []string{"D", "S", "N"}
 
 	for crew := 0; crew < crewCount; crew++ {
+		start := crew * stride
+
+		// Build which days in the 14-day period this crew works
+		onPattern := make([]bool, payPeriodDays)
+		for d := 0; d < shiftsPerPeriod; d++ {
+			onPattern[(start+d)%payPeriodDays] = true
+		}
+
 		for si := 0; si < 3; si++ {
 			empIdx := crew*3 + si
 			if empIdx >= n {
 				break
 			}
 			shift := shifts[si]
-			for block := 0; block < blocksPerEmp; block++ {
-				round := crew + block*crewCount
-				dayStart := round * onDays
-				for d := 0; d < onDays; d++ {
-					employees[empIdx].Assignments[dayStart+d] = shift
+			for day := 0; day < totalDays; day++ {
+				if onPattern[day%payPeriodDays] {
+					employees[empIdx].Assignments[day] = shift
 				}
-				employees[empIdx].Hours += onDays * hoursPerShift
 			}
+			employees[empIdx].Hours = shiftsPerPeriod * hoursPerShift * displayPeriods
 		}
 	}
 
-	return employees, totalDays
+	return employees, totalDays, info
 }
 
 func dateHeaders(start time.Time, periodDays int) []string {

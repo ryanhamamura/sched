@@ -12,11 +12,7 @@ import (
 	"github.com/ryanhamamura/via/h"
 )
 
-const (
-	defaultHoursPerShift = 8
-	defaultOnDays        = 3
-	defaultOffBlocks     = 2
-)
+const defaultHoursPerShift = 8
 
 var (
 	defaultStart = time.Date(2026, 1, 26, 0, 0, 0, 0, time.UTC)
@@ -48,20 +44,17 @@ type schedData struct {
 	headers   []string
 	start     time.Time
 	hps       int
-	onDays    int
-	offBlocks int
 	names     []string
 	totalDays int
+	info      PayPeriodInfo
 }
 
 func indexPage(c *via.Context) {
 	startDate := c.Signal(defaultStart.Format("2006-01-02"))
 	hoursPerShift := c.Signal(defaultHoursPerShift)
-	onDays := c.Signal(defaultOnDays)
-	offBlocks := c.Signal(defaultOffBlocks)
 	namesInput := c.Signal(defaultNames)
 
-	data := newSchedData(defaultStart, defaultHoursPerShift, defaultOnDays, defaultOffBlocks, defaultNames)
+	data := newSchedData(defaultStart, defaultHoursPerShift, defaultNames)
 
 	generate := c.Action(func() {
 		sd, err := time.Parse("2006-01-02", startDate.String())
@@ -72,16 +65,8 @@ func indexPage(c *via.Context) {
 		if hps <= 0 {
 			hps = defaultHoursPerShift
 		}
-		od := onDays.Int()
-		if od <= 0 {
-			od = defaultOnDays
-		}
-		ob := offBlocks.Int()
-		if ob < 0 {
-			ob = defaultOffBlocks
-		}
 
-		*data = *newSchedData(sd, hps, od, ob, namesInput.String())
+		*data = *newSchedData(sd, hps, namesInput.String())
 		c.Sync()
 	})
 
@@ -100,14 +85,6 @@ func indexPage(c *via.Context) {
 						h.Label(h.Attr("for", "hps"), h.Text("Hours per Shift")),
 						h.Input(h.Type("number"), h.ID("hps"), h.Attr("min", "1"), h.Attr("max", "24"), hoursPerShift.Bind()),
 					),
-					h.Div(
-						h.Label(h.Attr("for", "ondays"), h.Text("Days On")),
-						h.Input(h.Type("number"), h.ID("ondays"), h.Attr("min", "1"), h.Attr("max", "50"), onDays.Bind()),
-					),
-					h.Div(
-						h.Label(h.Attr("for", "offblocks"), h.Text("Blocks Off")),
-						h.Input(h.Type("number"), h.ID("offblocks"), h.Attr("min", "0"), h.Attr("max", "50"), offBlocks.Bind()),
-					),
 				),
 				h.Div(
 					h.Label(h.Attr("for", "names"), h.Text("Employees (comma-separated)")),
@@ -121,18 +98,17 @@ func indexPage(c *via.Context) {
 	})
 }
 
-func newSchedData(start time.Time, hps, onDays, offBlocks int, namesStr string) *schedData {
+func newSchedData(start time.Time, hps int, namesStr string) *schedData {
 	names := parseNames(namesStr)
-	employees, totalDays := buildSchedule(names, hps, onDays, offBlocks)
+	employees, totalDays, info := buildSchedule(names, hps)
 	return &schedData{
 		employees: employees,
 		headers:   dateHeaders(start, totalDays),
 		start:     start,
 		hps:       hps,
-		onDays:    onDays,
-		offBlocks: offBlocks,
 		names:     names,
 		totalDays: totalDays,
+		info:      info,
 	}
 }
 
@@ -148,27 +124,24 @@ func renderScheduleOutput(d *schedData) h.H {
 		d.totalDays,
 	)
 
-	offDays := d.offBlocks * d.onDays
+	info := d.info
+	minEmployees := info.CrewCount * 3
 
-	var patternNote h.H
-	if offDays == 0 {
-		patternNote = h.P(h.Em(h.Text(
-			fmt.Sprintf("Pattern: %d days on, 0 days off (same employees cover every block)", d.onDays),
-		)))
-	} else {
-		patternNote = h.P(h.Em(h.Text(
-			fmt.Sprintf("Pattern: %d days on, %d days off", d.onDays, offDays),
-		)))
+	summaryLine := fmt.Sprintf("%d days on, %d days off per pay period | %d hours",
+		info.ShiftsPerPeriod, info.OffDaysPerPeriod, info.HoursPerPeriod)
+	if info.HoursPerPeriod < maxHoursPerPeriod {
+		summaryLine += fmt.Sprintf(" (%dh max)", maxHoursPerPeriod)
 	}
 
-	csvURL := fmt.Sprintf("/download?start=%s&hps=%d&ondays=%d&offblocks=%d&names=%s",
-		d.start.Format("2006-01-02"), d.hps, d.onDays, d.offBlocks,
+	csvURL := fmt.Sprintf("/download?start=%s&hps=%d&names=%s",
+		d.start.Format("2006-01-02"), d.hps,
 		url.QueryEscape(strings.Join(d.names, ",")),
 	)
 
 	return h.Div(
 		h.P(h.Strong(h.Text("Schedule: ")), h.Text(periodStr)),
-		patternNote,
+		h.P(h.Em(h.Text(summaryLine))),
+		h.P(h.Em(h.Text(fmt.Sprintf("Crews: %d (%d employees minimum)", info.CrewCount, minEmployees)))),
 		renderScheduleTable(d.employees, d.headers),
 		h.P(h.A(h.Href(csvURL), h.Attr("download", ""), h.Text("Download CSV"))),
 	)
@@ -176,19 +149,31 @@ func renderScheduleOutput(d *schedData) h.H {
 
 func renderScheduleTable(employees []Employee, headers []string) h.H {
 	headerCells := []h.H{h.Th(h.Text("Employee"))}
-	for _, hdr := range headers {
-		headerCells = append(headerCells, h.Th(h.Text(hdr)))
+	for i, hdr := range headers {
+		if i == payPeriodDays {
+			headerCells = append(headerCells, h.Th(h.Class("period-boundary"), h.Text(hdr)))
+		} else {
+			headerCells = append(headerCells, h.Th(h.Text(hdr)))
+		}
 	}
 	headerCells = append(headerCells, h.Th(h.Text("Hours")))
 
 	var rows []h.H
 	for _, emp := range employees {
 		cells := []h.H{h.Td(h.Text(emp.Name))}
-		for _, a := range emp.Assignments {
+		for i, a := range emp.Assignments {
+			boundary := i == payPeriodDays
 			if a == "" {
-				cells = append(cells, h.Td())
+				if boundary {
+					cells = append(cells, h.Td(h.Class("period-boundary")))
+				} else {
+					cells = append(cells, h.Td())
+				}
 			} else {
 				cls := "cell-" + cellClass(a)
+				if boundary {
+					cls += " period-boundary"
+				}
 				cells = append(cells, h.Td(h.Class(cls), h.Strong(h.Text(a))))
 			}
 		}
@@ -215,17 +200,9 @@ func handleCSVDownload(w http.ResponseWriter, r *http.Request) {
 	if hps <= 0 {
 		hps = defaultHoursPerShift
 	}
-	od, _ := strconv.Atoi(q.Get("ondays"))
-	if od <= 0 {
-		od = defaultOnDays
-	}
-	ob, _ := strconv.Atoi(q.Get("offblocks"))
-	if ob < 0 {
-		ob = defaultOffBlocks
-	}
 
 	names := parseNames(q.Get("names"))
-	employees, totalDays := buildSchedule(names, hps, od, ob)
+	employees, totalDays, _ := buildSchedule(names, hps)
 	headers := dateHeaders(sd, totalDays)
 
 	w.Header().Set("Content-Type", "text/csv")
@@ -264,4 +241,5 @@ const cssStyles = `
 	.cell-night  { background: #ede9fe; color: #6d28d9; }
 	.cell-off    { background: #f3f4f6; color: #6b7280; }
 	.config { margin-bottom: 2rem; }
+	.period-boundary { border-left: 3px solid #374151; }
 `

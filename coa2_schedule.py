@@ -17,6 +17,13 @@ SHIFTS_2x12 = {"Days": "0700-1900", "Nights": "1900-0700"}
 POOL = [f"P-{i:02d}" for i in range(1, 36)]  # 35 people
 PAX_PER_SHIFT = 1
 
+# 3-2-2-3-2-2: 7 on / 7 off across a 14-day pay period
+PATTERN_A = [True]*3 + [False]*2 + [True]*2 + [False]*3 + [True]*2 + [False]*2
+PATTERN_B = [not x for x in PATTERN_A]  # complement — together they cover every day
+
+# 2 people per shift (A/B pair), N shifts per mode
+PEOPLE_PER_PP = {"3x8": 6, "2x12": 4}
+
 OUTPUT_FILE = "COA2_2026_Individual_Schedule_PP05_PP10.xlsx"
 
 
@@ -47,34 +54,33 @@ def build_daily_schedule() -> pd.DataFrame:
     pay_periods = make_pay_periods(START_DATE, END_DATE)
     h = hours_per_shift()
     shift_names = list(SHIFTS_3x8.keys()) if STAFFING_MODE == "3x8" else list(SHIFTS_2x12.keys())
+    ppp = PEOPLE_PER_PP[STAFFING_MODE]
     rows = []
 
-    # Track hours per person per pay period for 80h cap
     cursor = 0
+    for _pp_idx, pp_label, pp_start, pp_end in pay_periods:
+        # Pick next batch of people from the pool
+        assigned = [POOL[(cursor + i) % len(POOL)] for i in range(ppp)]
+        cursor += ppp
 
-    for pp_idx, pp_label, pp_start, pp_end in pay_periods:
-        person_hours: dict[str, int] = {}
+        # Pair them up per shift: (pattern-A person, pattern-B person)
+        shift_pairs = []
+        for s_idx, shift in enumerate(shift_names):
+            person_a = assigned[s_idx * 2]
+            person_b = assigned[s_idx * 2 + 1]
+            shift_pairs.append((shift, person_a, person_b))
 
         day = pp_start
+        day_idx = 0
         while day <= pp_end:
             week_num = day.isocalendar()[1]
-
-            for shift in shift_names:
-                # Find next person who won't exceed 80h cap
-                attempts = 0
-                while attempts < len(POOL):
-                    person = POOL[cursor % len(POOL)]
-                    accumulated = person_hours.get(person, 0)
-                    if accumulated + h <= MAX_HOURS_PER_PAY_PERIOD:
-                        person_hours[person] = accumulated + h
-                        cursor += 1
-                        break
-                    cursor += 1
-                    attempts += 1
-
-                rows.append([day, pp_label, week_num, person, shift, h])
-
+            for shift, person_a, person_b in shift_pairs:
+                if day_idx < len(PATTERN_A) and PATTERN_A[day_idx]:
+                    rows.append([day, pp_label, week_num, person_a, shift, h])
+                if day_idx < len(PATTERN_B) and PATTERN_B[day_idx]:
+                    rows.append([day, pp_label, week_num, person_b, shift, h])
             day += timedelta(days=1)
+            day_idx += 1
 
     return pd.DataFrame(rows, columns=[
         "Date", "Pay Period", "Week", "Name", "Shift", "Hours",
@@ -119,7 +125,13 @@ def build_fairness_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
         .sum()
         .rename(columns={"Hours": "Total Hours"})
     )
-    return total_shifts.merge(total_hours, on="Name")
+    pp_count = (
+        daily_df
+        .groupby("Name", as_index=False)["Pay Period"]
+        .nunique()
+        .rename(columns={"Pay Period": "PPs Worked"})
+    )
+    return total_shifts.merge(total_hours, on="Name").merge(pp_count, on="Name")
 
 
 def build_coverage_check(daily_df: pd.DataFrame) -> pd.DataFrame:
@@ -179,29 +191,34 @@ def validate(daily_df: pd.DataFrame, pp_df: pd.DataFrame,
     else:
         print(f"PASS: Every shift has ≥{PAX_PER_SHIFT} PAX every day")
 
-    # Fairness: max-min shift spread should be ≤ 1
-    spread = fairness_df["Total Shifts"].max() - fairness_df["Total Shifts"].min()
-    if spread > 1:
-        print(f"FAIL: Shift distribution spread is {spread} (max allowed: 1)")
+    # Fairness: PP count spread should be ≤ 1
+    pp_spread = fairness_df["PPs Worked"].max() - fairness_df["PPs Worked"].min()
+    if pp_spread > 1:
+        print(f"FAIL: PP assignment spread is {pp_spread} (max allowed: 1)")
         ok = False
     else:
-        print(f"PASS: Shift distribution spread is {spread} (≤ 1)")
+        print(f"PASS: PP assignment spread is {pp_spread} (≤ 1)")
 
     # Stats
     hours_stats = pp_df["Total Hours"]
     print(f"\nHours per person per PP: min={hours_stats.min()}, "
           f"max={hours_stats.max()}, avg={hours_stats.mean():.1f}")
-    print(f"Shifts per person overall: min={fairness_df['Total Shifts'].min()}, "
-          f"max={fairness_df['Total Shifts'].max()}, "
-          f"avg={fairness_df['Total Shifts'].mean():.1f}")
+    print(f"PPs worked per person: min={fairness_df['PPs Worked'].min()}, "
+          f"max={fairness_df['PPs Worked'].max()}")
+    print(f"Total people used: {len(fairness_df)} / {len(POOL)}")
 
     return ok
 
 
 def main() -> None:
+    ppp = PEOPLE_PER_PP[STAFFING_MODE]
+    pay_periods = make_pay_periods(START_DATE, END_DATE)
+    total_slots = ppp * len(pay_periods)
+
     print(f"Generating COA2 schedule ({STAFFING_MODE} mode)")
     print(f"  Date range: {START_DATE} to {END_DATE}")
-    print(f"  Pool: {len(POOL)} personnel, {PAX_PER_SHIFT} per shift")
+    print(f"  Pool: {len(POOL)} personnel, {ppp} per PP ({total_slots} total slots)")
+    print(f"  On/off pattern: 3-2-2-3-2-2 (7 on / 7 off per PP)")
     print()
 
     daily_df = build_daily_schedule()

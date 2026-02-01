@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,7 +13,14 @@ import (
 	"github.com/ryanhamamura/via/h"
 )
 
-const defaultHoursPerShift = 8
+const (
+	defaultHoursPerShift = 8
+	defaultDaysOn        = 3
+
+	// Named rotation patterns (28-day cycles, 50% duty, 4 crews)
+	patternPanama = "OOFFOOO" + "FFOOFFF" + "OOFFOOO" + "FFOOFFF"
+	patternDuPont = "OOOO" + "FFF" + "OOO" + "F" + "OOO" + "FFF" + "OOOO" + "FFFFFFF"
+)
 
 var (
 	defaultStart = time.Date(2026, 1, 26, 0, 0, 0, 0, time.UTC)
@@ -44,17 +52,48 @@ type schedData struct {
 	headers   []string
 	start     time.Time
 	hps       int
+	pattern   string
+	crews     int
 	names     []string
 	totalDays int
 	info      PayPeriodInfo
+	errMsg    string
 }
 
 func indexPage(c *via.Context) {
 	startDate := c.Signal(defaultStart.Format("2006-01-02"))
 	hoursPerShift := c.Signal(defaultHoursPerShift)
 	namesInput := c.Signal(defaultNames)
+	daysOnInput := c.Signal(defaultDaysOn)
+	presetInput := c.Signal("simple")
+	patternInput := c.Signal(SimplePattern(defaultDaysOn, 3).String())
+	crewOverride := c.Signal(0)
 
-	data := newSchedData(defaultStart, defaultHoursPerShift, defaultNames)
+	defaultPattern := SimplePattern(defaultDaysOn, 3)
+	defaultCrews := int(math.Ceil(float64(len(parseNames(defaultNames))) / 3.0))
+	data := newSchedData(defaultStart, defaultHoursPerShift, defaultPattern, defaultCrews, defaultNames)
+
+	// Fill pattern from preset when preset changes
+	applyPreset := c.Action(func() {
+		switch presetInput.String() {
+		case "panama":
+			patternInput.SetValue(patternPanama)
+		case "dupont":
+			patternInput.SetValue(patternDuPont)
+		case "simple":
+			don := daysOnInput.Int()
+			if don < 1 {
+				don = 1
+			}
+			names := parseNames(namesInput.String())
+			crews := int(math.Ceil(float64(len(names)) / 3.0))
+			if crews < 1 {
+				crews = 1
+			}
+			patternInput.SetValue(SimplePattern(don, crews).String())
+		}
+		c.Sync()
+	})
 
 	generate := c.Action(func() {
 		sd, err := time.Parse("2006-01-02", startDate.String())
@@ -66,7 +105,20 @@ func indexPage(c *via.Context) {
 			hps = defaultHoursPerShift
 		}
 
-		*data = *newSchedData(sd, hps, namesInput.String())
+		pat, err := ParsePattern(patternInput.String())
+		if err != nil {
+			data.errMsg = fmt.Sprintf("Invalid pattern: %v", err)
+			data.employees = nil
+			c.Sync()
+			return
+		}
+
+		crews := crewOverride.Int()
+		if crews <= 0 {
+			crews = MinCrewsForCoverage(pat)
+		}
+
+		*data = *newSchedData(sd, hps, pat, crews, namesInput.String())
 		c.Sync()
 	})
 
@@ -85,6 +137,30 @@ func indexPage(c *via.Context) {
 						h.Label(h.Attr("for", "hps"), h.Text("Hours per Shift")),
 						h.Input(h.Type("number"), h.ID("hps"), h.Attr("min", "1"), h.Attr("max", "24"), hoursPerShift.Bind()),
 					),
+					h.Div(
+						h.Label(h.Attr("for", "preset"), h.Text("Pattern Preset")),
+						h.Select(h.ID("preset"), presetInput.Bind(), applyPreset.OnChange(),
+							h.Option(h.Value("simple"), h.Text("Simple (N-on / off)")),
+							h.Option(h.Value("panama"), h.Text("Panama (28-day)")),
+							h.Option(h.Value("dupont"), h.Text("DuPont (28-day)")),
+							h.Option(h.Value("custom"), h.Text("Custom")),
+						),
+					),
+				),
+				h.Div(h.Class("grid"),
+					h.Div(
+						h.Label(h.Attr("for", "don"), h.Text("Days On (simple mode)")),
+						h.Input(h.Type("number"), h.ID("don"), h.Attr("min", "1"), h.Attr("max", "14"), daysOnInput.Bind()),
+					),
+					h.Div(
+						h.Label(h.Attr("for", "crews"), h.Text("Crew Override (0 = auto)")),
+						h.Input(h.Type("number"), h.ID("crews"), h.Attr("min", "0"), h.Attr("max", "50"), crewOverride.Bind()),
+					),
+				),
+				h.Div(
+					h.Label(h.Attr("for", "pattern"), h.Text("Rotation Pattern (O=on, F=off)")),
+					h.Input(h.Type("text"), h.ID("pattern"), patternInput.Bind(),
+						h.Attr("placeholder", "e.g. OOFFOOO...")),
 				),
 				h.Div(
 					h.Label(h.Attr("for", "names"), h.Text("Employees (comma-separated)")),
@@ -98,14 +174,16 @@ func indexPage(c *via.Context) {
 	})
 }
 
-func newSchedData(start time.Time, hps int, namesStr string) *schedData {
+func newSchedData(start time.Time, hps int, pat RotationPattern, crews int, namesStr string) *schedData {
 	names := parseNames(namesStr)
-	employees, totalDays, info := buildSchedule(names, hps)
+	employees, totalDays, info := buildSchedule(names, hps, pat, crews)
 	return &schedData{
 		employees: employees,
 		headers:   dateHeaders(start, totalDays),
 		start:     start,
 		hps:       hps,
+		pattern:   pat.String(),
+		crews:     crews,
 		names:     names,
 		totalDays: totalDays,
 		info:      info,
@@ -113,6 +191,9 @@ func newSchedData(start time.Time, hps int, namesStr string) *schedData {
 }
 
 func renderScheduleOutput(d *schedData) h.H {
+	if d.errMsg != "" {
+		return h.P(h.Strong(h.Text(d.errMsg)))
+	}
 	if len(d.employees) == 0 {
 		return h.P(h.Em(h.Text("No employees to schedule")))
 	}
@@ -127,24 +208,40 @@ func renderScheduleOutput(d *schedData) h.H {
 	info := d.info
 	minEmployees := info.CrewCount * 3
 
-	summaryLine := fmt.Sprintf("%d days on, %d days off per pay period | %d hours",
-		info.ShiftsPerPeriod, info.OffDaysPerPeriod, info.HoursPerPeriod)
-	if info.HoursPerPeriod < maxHoursPerPeriod {
-		summaryLine += fmt.Sprintf(" (%dh max)", maxHoursPerPeriod)
+	summaryLine := fmt.Sprintf("Pattern: %s (%d-day cycle, %d crews) | %d shifts, %d hours per pay period",
+		info.PatternString, info.PatternLength, info.CrewCount, info.ShiftsPerPeriod, info.HoursPerPeriod)
+	if info.HoursPerPeriod > maxHoursPerPeriod {
+		summaryLine += " (exceeds 80h cap)"
 	}
 
-	csvURL := fmt.Sprintf("/download?start=%s&hps=%d&names=%s",
-		d.start.Format("2006-01-02"), d.hps,
-		url.QueryEscape(strings.Join(d.names, ",")),
-	)
-
-	return h.Div(
+	elements := []h.H{
 		h.P(h.Strong(h.Text("Schedule: ")), h.Text(periodStr)),
 		h.P(h.Em(h.Text(summaryLine))),
 		h.P(h.Em(h.Text(fmt.Sprintf("Crews: %d (%d employees minimum)", info.CrewCount, minEmployees)))),
+	}
+
+	if len(info.UncoveredDays) > 0 {
+		dayStrs := make([]string, len(info.UncoveredDays))
+		for i, d := range info.UncoveredDays {
+			dayStrs[i] = fmt.Sprintf("%d", d+1)
+		}
+		elements = append(elements, h.P(h.Strong(
+			h.Text(fmt.Sprintf("Warning: %d uncovered day(s) in cycle: %s",
+				len(info.UncoveredDays), strings.Join(dayStrs, ", "))))))
+	}
+
+	csvURL := fmt.Sprintf("/download?start=%s&hps=%d&pattern=%s&crews=%d&names=%s",
+		d.start.Format("2006-01-02"), d.hps,
+		url.QueryEscape(d.pattern), d.crews,
+		url.QueryEscape(strings.Join(d.names, ",")),
+	)
+
+	elements = append(elements,
 		renderScheduleTable(d.employees, d.headers),
 		h.P(h.A(h.Href(csvURL), h.Attr("download", ""), h.Text("Download CSV"))),
 	)
+
+	return h.Div(elements...)
 }
 
 func renderScheduleTable(employees []Employee, headers []string) h.H {
@@ -201,8 +298,20 @@ func handleCSVDownload(w http.ResponseWriter, r *http.Request) {
 		hps = defaultHoursPerShift
 	}
 
+	patStr := q.Get("pattern")
+	pat, err := ParsePattern(patStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid pattern: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	crews, _ := strconv.Atoi(q.Get("crews"))
+	if crews <= 0 {
+		crews = MinCrewsForCoverage(pat)
+	}
+
 	names := parseNames(q.Get("names"))
-	employees, totalDays, _ := buildSchedule(names, hps)
+	employees, totalDays, _ := buildSchedule(names, hps, pat, crews)
 	headers := dateHeaders(sd, totalDays)
 
 	w.Header().Set("Content-Type", "text/csv")

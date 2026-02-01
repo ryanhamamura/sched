@@ -77,8 +77,12 @@ def build_daily_schedule() -> pd.DataFrame:
             for shift, person_a, person_b in shift_pairs:
                 if day_idx < len(PATTERN_A) and PATTERN_A[day_idx]:
                     rows.append([day, pp_label, week_num, person_a, shift, h])
+                else:
+                    rows.append([day, pp_label, week_num, person_a, "Normal Duty", h])
                 if day_idx < len(PATTERN_B) and PATTERN_B[day_idx]:
                     rows.append([day, pp_label, week_num, person_b, shift, h])
+                else:
+                    rows.append([day, pp_label, week_num, person_b, "Normal Duty", h])
             day += timedelta(days=1)
             day_idx += 1
 
@@ -87,9 +91,14 @@ def build_daily_schedule() -> pd.DataFrame:
     ])
 
 
+def _duty_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter out Normal Duty rows — only real shift assignments."""
+    return df[df["Shift"] != "Normal Duty"]
+
+
 def build_weekly_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
     return (
-        daily_df
+        _duty_only(daily_df)
         .groupby(["Name", "Week"], as_index=False)["Hours"]
         .sum()
         .rename(columns={"Hours": "Weekly Hours"})
@@ -97,36 +106,40 @@ def build_weekly_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_pp_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
+    duty_df = _duty_only(daily_df)
     hours = (
-        daily_df
+        duty_df
         .groupby(["Name", "Pay Period"], as_index=False)["Hours"]
         .sum()
         .rename(columns={"Hours": "Total Hours"})
     )
     shifts = (
-        daily_df
+        duty_df
         .groupby(["Name", "Pay Period"], as_index=False)
         .size()
         .rename(columns={"size": "Shifts"})
     )
-    return hours.merge(shifts, on=["Name", "Pay Period"])
+    result = hours.merge(shifts, on=["Name", "Pay Period"])
+    result["Normal Duty Hours"] = MAX_HOURS_PER_PAY_PERIOD - result["Total Hours"]
+    return result
 
 
 def build_fairness_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
+    duty_df = _duty_only(daily_df)
     total_shifts = (
-        daily_df
+        duty_df
         .groupby("Name", as_index=False)
         .size()
         .rename(columns={"size": "Total Shifts"})
     )
     total_hours = (
-        daily_df
+        duty_df
         .groupby("Name", as_index=False)["Hours"]
         .sum()
         .rename(columns={"Hours": "Total Hours"})
     )
     pp_count = (
-        daily_df
+        duty_df
         .groupby("Name", as_index=False)["Pay Period"]
         .nunique()
         .rename(columns={"Pay Period": "PPs Worked"})
@@ -136,7 +149,7 @@ def build_fairness_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_coverage_check(daily_df: pd.DataFrame) -> pd.DataFrame:
     pax = (
-        daily_df
+        _duty_only(daily_df)
         .groupby(["Date", "Pay Period", "Shift"], as_index=False)
         .size()
         .pivot_table(index=["Date", "Pay Period"],

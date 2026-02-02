@@ -16,6 +16,7 @@ SHIFTS_2x12 = {"Days": "0700-1900", "Nights": "1900-0700"}
 
 POOL = [f"P-{i:02d}" for i in range(1, 36)]  # 35 people
 PAX_PER_SHIFT = 1
+ADMIN_DAYS_PER_PP = 3
 
 # 3-2-2-3-2-2: 7 on / 7 off across a 14-day pay period
 PATTERN_A = [True]*3 + [False]*2 + [True]*2 + [False]*3 + [True]*2 + [False]*2
@@ -70,6 +71,8 @@ def build_daily_schedule() -> pd.DataFrame:
             person_b = assigned[s_idx * 2 + 1]
             shift_pairs.append((shift, person_a, person_b))
 
+        admin_count: dict[str, int] = {}
+
         day = pp_start
         day_idx = 0
         while day <= pp_end:
@@ -77,12 +80,14 @@ def build_daily_schedule() -> pd.DataFrame:
             for shift, person_a, person_b in shift_pairs:
                 if day_idx < len(PATTERN_A) and PATTERN_A[day_idx]:
                     rows.append([day, pp_label, week_num, person_a, shift, h])
-                else:
+                elif admin_count.get(person_a, 0) < ADMIN_DAYS_PER_PP:
                     rows.append([day, pp_label, week_num, person_a, "Normal Duty", h])
+                    admin_count[person_a] = admin_count.get(person_a, 0) + 1
                 if day_idx < len(PATTERN_B) and PATTERN_B[day_idx]:
                     rows.append([day, pp_label, week_num, person_b, shift, h])
-                else:
+                elif admin_count.get(person_b, 0) < ADMIN_DAYS_PER_PP:
                     rows.append([day, pp_label, week_num, person_b, "Normal Duty", h])
+                    admin_count[person_b] = admin_count.get(person_b, 0) + 1
             day += timedelta(days=1)
             day_idx += 1
 

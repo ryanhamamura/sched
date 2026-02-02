@@ -83,11 +83,15 @@ def build_daily_schedule() -> pd.DataFrame:
                 elif admin_count.get(person_a, 0) < ADMIN_DAYS_PER_PP:
                     rows.append([day, pp_label, week_num, person_a, "Normal Duty", h])
                     admin_count[person_a] = admin_count.get(person_a, 0) + 1
+                else:
+                    rows.append([day, pp_label, week_num, person_a, "Off", 0])
                 if day_idx < len(PATTERN_B) and PATTERN_B[day_idx]:
                     rows.append([day, pp_label, week_num, person_b, shift, h])
                 elif admin_count.get(person_b, 0) < ADMIN_DAYS_PER_PP:
                     rows.append([day, pp_label, week_num, person_b, "Normal Duty", h])
                     admin_count[person_b] = admin_count.get(person_b, 0) + 1
+                else:
+                    rows.append([day, pp_label, week_num, person_b, "Off", 0])
             day += timedelta(days=1)
             day_idx += 1
 
@@ -97,8 +101,8 @@ def build_daily_schedule() -> pd.DataFrame:
 
 
 def _duty_only(df: pd.DataFrame) -> pd.DataFrame:
-    """Filter out Normal Duty rows — only real shift assignments."""
-    return df[df["Shift"] != "Normal Duty"]
+    """Filter out Normal Duty and Off rows — only real shift assignments."""
+    return df[~df["Shift"].isin(["Normal Duty", "Off"])]
 
 
 def build_weekly_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
